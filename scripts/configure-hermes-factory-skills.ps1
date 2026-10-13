@@ -39,6 +39,19 @@ $releasedSkillDigests = @{
     'captain-factory-report-captain' = '077dd7671601707aeb07aca32c1f84ed6d2ef34c90129e950c96a92c2d5d3827'
 }
 
+# Hermes keeps learning (/learn, the post-turn background review fork, and
+# ordinary turns may author skills), but skills.write_approval stages every
+# skill write from any origin -- including Captain's one-shot runs, which do not
+# bypass the gate -- until an operator approves it with /skills approve. The
+# security scanner also checks agent-written skills, and the review cadence is
+# pinned because Hermes has no built-in default for it in config.yaml.
+$learningSettings = [ordered]@{
+    'skills.write_approval' = $true
+    'skills.guard_agent_created' = $true
+    'skills.creation_nudge_interval' = 10
+}
+$learningBaselineSchema = 'captain.hermes-learning-baseline.v1'
+
 function Invoke-Hermes {
     param([Parameter(Mandatory)][string[]]$Arguments)
 
@@ -216,6 +229,146 @@ function Remove-HermesBundle {
     throw "Hermes command failed: hermes bundles delete $Name`n$outputText"
 }
 
+function Read-HermesConfigValue {
+    param([Parameter(Mandatory)][string]$Key)
+
+    $output = & $HermesExecutable 'config' 'get' $Key '--json' 2>&1
+    $exitCode = $LASTEXITCODE
+    $outputText = [string]::Join([Environment]::NewLine, @($output)).Trim()
+    if ($exitCode -ne 0) {
+        if ($outputText -match '(?i)config key not set') {
+            return [pscustomobject]@{ Present = $false; Value = $null }
+        }
+        throw "Hermes command failed: hermes config get $Key --json`n$outputText"
+    }
+    try {
+        $value = $outputText | ConvertFrom-Json
+    }
+    catch {
+        throw "Hermes returned invalid JSON for ${Key}: $($_.Exception.Message)"
+    }
+    return [pscustomobject]@{ Present = $true; Value = $value }
+}
+
+function ConvertTo-HermesConfigArgument {
+    param([Parameter(Mandatory)][AllowNull()][object]$Value)
+
+    if ($Value -is [bool]) {
+        return $(if ($Value) { 'true' } else { 'false' })
+    }
+    if ($Value -is [int] -or $Value -is [long]) {
+        return [string]$Value
+    }
+    if ($Value -is [string]) {
+        return $Value
+    }
+    throw "Refusing to write unsupported Hermes learning value of type $($Value.GetType().Name)."
+}
+
+function Test-HermesConfigValue {
+    param(
+        [Parameter(Mandatory)]$Actual,
+        [Parameter(Mandatory)][AllowNull()][object]$Expected
+    )
+
+    if (-not $Actual.Present) {
+        return $false
+    }
+    if ($Expected -is [bool]) {
+        return ($Actual.Value -is [bool]) -and ($Actual.Value -eq $Expected)
+    }
+    if ($Expected -is [string]) {
+        # Hermes coerces boolean-like strings ("on", "yes") when setting.
+        return ($Actual.Value -is [bool]) -or [string]::Equals([string]$Actual.Value, $Expected, [StringComparison]::Ordinal)
+    }
+    return ($Actual.Value -is [long] -or $Actual.Value -is [int]) -and ([long]$Actual.Value -eq [long]$Expected)
+}
+
+function Set-HermesConfigValue {
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)][AllowNull()][object]$Value
+    )
+
+    Invoke-Hermes -Arguments @('config', 'set', $Key, (ConvertTo-HermesConfigArgument -Value $Value)) | Out-Null
+    if (-not (Test-HermesConfigValue -Actual (Read-HermesConfigValue -Key $Key) -Expected $Value)) {
+        throw "Hermes did not persist $Key as $(ConvertTo-HermesConfigArgument -Value $Value)."
+    }
+}
+
+function Set-HermesLearningSettings {
+    param([Parameter(Mandatory)][string]$BaselinePath)
+
+    $current = [ordered]@{}
+    foreach ($key in $learningSettings.Keys) {
+        $current[$key] = Read-HermesConfigValue -Key $key
+    }
+
+    # Record the operator's pre-Captain values exactly once, so a re-run never
+    # replaces them with Captain's own settings and -Remove can restore them.
+    if (-not (Test-Path -LiteralPath $BaselinePath -PathType Leaf)) {
+        $baseline = [ordered]@{ schema = $learningBaselineSchema; settings = [ordered]@{} }
+        foreach ($key in $learningSettings.Keys) {
+            $baseline.settings[$key] = [ordered]@{
+                present = $current[$key].Present
+                value = $current[$key].Value
+            }
+        }
+        $baselineJson = ($baseline | ConvertTo-Json -Depth 5) + "`n"
+        [System.IO.Directory]::CreateDirectory((Split-Path -Parent $BaselinePath)) | Out-Null
+        [System.IO.File]::WriteAllText($BaselinePath, $baselineJson, [System.Text.UTF8Encoding]::new($false))
+    }
+
+    $changed = $false
+    foreach ($key in $learningSettings.Keys) {
+        if (Test-HermesConfigValue -Actual $current[$key] -Expected $learningSettings[$key]) {
+            continue
+        }
+        Set-HermesConfigValue -Key $key -Value $learningSettings[$key]
+        $changed = $true
+    }
+    return $changed
+}
+
+function Restore-HermesLearningSettings {
+    param([Parameter(Mandatory)][string]$BaselinePath)
+
+    if (-not (Test-Path -LiteralPath $BaselinePath -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $baseline = [System.IO.File]::ReadAllText($BaselinePath) | ConvertFrom-Json
+    }
+    catch {
+        throw "Captain Hermes learning baseline is not valid JSON: $BaselinePath"
+    }
+    if ($baseline.schema -ne $learningBaselineSchema) {
+        throw "Captain Hermes learning baseline has an unexpected schema: $BaselinePath"
+    }
+    foreach ($key in $learningSettings.Keys) {
+        $recorded = $baseline.settings.$key
+        if ($null -eq $recorded) {
+            throw "Captain Hermes learning baseline does not record $key."
+        }
+        if ($recorded.present -and $null -ne $recorded.value) {
+            Set-HermesConfigValue -Key $key -Value $recorded.value
+        }
+        else {
+            # `config get` reports built-in defaults too, so unset directly and
+            # accept "not set" for a key the operator already removed.
+            $output = & $HermesExecutable 'config' 'unset' $key 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                $outputText = [string]::Join([Environment]::NewLine, @($output))
+                if ($outputText -notmatch '(?i)config key not set') {
+                    throw "Hermes command failed: hermes config unset $key`n$outputText"
+                }
+            }
+        }
+    }
+    [System.IO.File]::Delete($BaselinePath)
+    return $true
+}
+
 function Invoke-SafeYamlProjection {
     param(
         [Parameter(Mandatory)][ValidateSet('skill-name', 'bundle')][string]$Mode,
@@ -374,6 +527,7 @@ if (-not $configuredHermesHome) {
     $configuredHermesHome = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)) '.hermes'
 }
 $configuredHermesHome = [System.IO.Path]::GetFullPath($configuredHermesHome)
+$learningBaselinePath = Join-Path $configuredHermesHome 'captain-hermes-learning-baseline.json'
 
 $externalDirectoryEntries = @(Read-ExternalDirectoryEntries -HermesHome $configuredHermesHome)
 $otherDirectoryEntries = @(
@@ -398,11 +552,15 @@ if ($Remove) {
         }
     }
     $bundleRemoved = Remove-HermesBundle -Name $bundleName
-    if ($targetCount -eq 0 -and -not $bundleRemoved) {
+    $learningRestored = Restore-HermesLearningSettings -BaselinePath $learningBaselinePath
+    if ($targetCount -eq 0 -and -not $bundleRemoved -and -not $learningRestored) {
         Write-Output "Already removed $skillRoot and /$bundleName; unrelated external directories were preserved."
     }
     else {
         Write-Output "Removed $skillRoot and /$bundleName; unrelated external directories were preserved."
+    }
+    if ($learningRestored) {
+        Write-Output 'Restored the Hermes learning settings recorded before Captain configured them.'
     }
     exit 0
 }
@@ -502,9 +660,12 @@ foreach ($skillName in $skillNames) {
     }
 }
 
-if ($configurationChanged) {
+$learningChanged = Set-HermesLearningSettings -BaselinePath $learningBaselinePath
+
+if ($configurationChanged -or $learningChanged) {
     Write-Output "Configured $skillRoot and verified /$bundleName."
 }
 else {
     Write-Output "Already configured $skillRoot; verified /$bundleName."
 }
+Write-Output 'Hermes learning is on with approval: review learned skills with /skills pending, /skills diff <id>, then /skills approve <id> or /skills reject <id>.'

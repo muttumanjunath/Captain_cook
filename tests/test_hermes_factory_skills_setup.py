@@ -140,19 +140,79 @@ def _write_fake_hermes(tmp_path: Path) -> Path:
             with (home / "calls.log").open("a", encoding="utf-8") as log:
                 log.write(json.dumps(args) + "\\n")
 
+            # Mirrors the pinned Hermes CLI: `config get` reads the user config
+            # merged over built-in defaults, `config set` coerces booleans and
+            # integers, and both `get` and `unset` exit 1 for a key that is not
+            # set. skills.creation_nudge_interval has no built-in default.
+            DEFAULTS = {
+                "skills": {
+                    "external_dirs": [],
+                    "write_approval": False,
+                    "guard_agent_created": False,
+                }
+            }
+            MISSING = object()
+
+
+            def merged(base: dict, override: dict) -> dict:
+                result = dict(base)
+                for key, value in override.items():
+                    if isinstance(value, dict) and isinstance(result.get(key), dict):
+                        result[key] = merged(result[key], value)
+                    else:
+                        result[key] = value
+                return result
+
+
+            def lookup(config: dict, dotted: str):
+                node = config
+                for part in dotted.split("."):
+                    if not isinstance(node, dict) or part not in node:
+                        return MISSING
+                    node = node[part]
+                return node
+
+
+            def coerce(dotted: str, raw: str):
+                if dotted == "skills.external_dirs":
+                    return json.loads(raw)
+                lowered = raw.lower()
+                if lowered in {"true", "yes", "on"}:
+                    return True
+                if lowered in {"false", "no", "off"}:
+                    return False
+                if raw.isdigit():
+                    return int(raw)
+                return raw
+
+
             if args[:2] == ["config", "get"]:
-                value = load_config().get("skills", {}).get("external_dirs", [])
+                value = lookup(merged(DEFAULTS, load_config()), args[2])
+                if value is MISSING:
+                    print(f"Config key not set: {args[2]}", file=sys.stderr)
+                    raise SystemExit(1)
                 print(json.dumps(value))
             elif args[:2] == ["config", "set"]:
                 config = load_config()
-                config.setdefault("skills", {})["external_dirs"] = json.loads(args[3])
+                *parents, leaf = args[2].split(".")
+                node = config
+                for part in parents:
+                    node = node.setdefault(part, {})
+                node[leaf] = coerce(args[2], args[3])
                 save_config(config)
-                print("set skills.external_dirs")
+                print(f"set {args[2]}")
             elif args[:2] == ["config", "unset"]:
                 config = load_config()
-                config.setdefault("skills", {}).pop("external_dirs", None)
+                *parents, leaf = args[2].split(".")
+                node = config
+                for part in parents:
+                    node = node.get(part, {}) if isinstance(node, dict) else {}
+                if not isinstance(node, dict) or leaf not in node:
+                    print(f"Config key not set: {args[2]}", file=sys.stderr)
+                    raise SystemExit(1)
+                del node[leaf]
                 save_config(config)
-                print("unset skills.external_dirs")
+                print(f"unset {args[2]}")
             elif args[:2] == ["skills", "list"]:
                 config = load_config()
                 disabled = set(config.get("skills", {}).get("disabled", []))
@@ -301,6 +361,95 @@ def test_configure_script_preserves_external_dirs_and_is_idempotent(
     assert "already configured" in second.stdout.lower()
 
 
+LEARNING_BASELINE = "captain-hermes-learning-baseline.json"
+
+
+def test_configure_script_enables_hermes_learning_with_approval(
+    tmp_path: Path,
+) -> None:
+    env, hermes_home = _environment(tmp_path)
+
+    first = subprocess.run(
+        _command(ROOT), env=env, text=True, capture_output=True, check=True
+    )
+    second = subprocess.run(
+        _command(ROOT), env=env, text=True, capture_output=True, check=True
+    )
+
+    config = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8"))
+    # Learning stays on, but every skill write Hermes makes (/learn, the
+    # background review fork, Captain one-shot runs) is staged for approval.
+    assert config["skills"]["write_approval"] is True
+    assert config["skills"]["guard_agent_created"] is True
+    assert config["skills"]["creation_nudge_interval"] == 10
+    assert "/skills pending" in first.stdout
+    assert "configured" in first.stdout.lower()
+    assert "already configured" in second.stdout.lower()
+
+
+def test_remove_restores_learning_settings_recorded_before_first_configure(
+    tmp_path: Path,
+) -> None:
+    env, hermes_home = _environment(tmp_path)
+    unrelated = (tmp_path / "unrelated-skills").resolve()
+    unrelated.mkdir()
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "skills": {
+                    "external_dirs": [str(unrelated)],
+                    "write_approval": False,
+                    "creation_nudge_interval": 15,
+                },
+                "memory": {"write_approval": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    subprocess.run(_command(ROOT), env=env, text=True, capture_output=True, check=True)
+    # A second configure must not replace the recorded pre-Captain baseline
+    # with Captain's own values.
+    subprocess.run(_command(ROOT), env=env, text=True, capture_output=True, check=True)
+    assert (hermes_home / LEARNING_BASELINE).exists()
+
+    removed = subprocess.run(
+        _command(ROOT, remove=True),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    config = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8"))
+    assert config["skills"]["external_dirs"] == [str(unrelated)]
+    assert config["skills"]["write_approval"] is False
+    assert config["skills"]["creation_nudge_interval"] == 15
+    assert config["skills"].get("guard_agent_created", False) is False
+    assert config["memory"] == {"write_approval": True}
+    assert not (hermes_home / LEARNING_BASELINE).exists()
+    assert "learning" in removed.stdout.lower()
+
+
+def test_remove_unsets_learning_keys_that_were_absent_before_configure(
+    tmp_path: Path,
+) -> None:
+    env, hermes_home = _environment(tmp_path)
+
+    subprocess.run(_command(ROOT), env=env, text=True, capture_output=True, check=True)
+    subprocess.run(
+        _command(ROOT, remove=True), env=env, text=True, capture_output=True, check=True
+    )
+
+    config = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8")) or {}
+    skills = config.get("skills", {})
+    assert "creation_nudge_interval" not in skills
+    assert skills.get("write_approval", False) is False
+    assert skills.get("guard_agent_created", False) is False
+    assert not (hermes_home / LEARNING_BASELINE).exists()
+
+
 def test_configure_script_rejects_changed_or_missing_released_skill(
     tmp_path: Path,
 ) -> None:
@@ -324,6 +473,7 @@ def test_configure_script_rejects_changed_or_missing_released_skill(
     assert result.returncode != 0
     assert "digest mismatch" in (result.stdout + result.stderr).lower()
     assert not (hermes_home / "config.yaml").exists()
+    assert not (hermes_home / LEARNING_BASELINE).exists()
 
 
 @pytest.mark.parametrize(
@@ -608,6 +758,10 @@ def test_runbook_documents_setup_verification_and_scoped_rollback() -> None:
         "hermes bundles show captain-agent-factory-loop",
         "-Remove",
         "preserves unrelated external directories",
+        "skills.write_approval",
+        "/skills pending",
+        "/skills approve",
+        "/learn",
     ):
         assert phrase.lower() in text.lower()
     assert "hermes skills reset" not in text.lower()

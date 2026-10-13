@@ -46,7 +46,44 @@ hermes skills list --enabled-only
 hermes bundles show captain-agent-factory-loop
 ```
 
-Rollback removes only this repository path and this bundle. It preserves unrelated external directories:
+### Hermes learning with approval
+
+The same command keeps Hermes' learning on but puts every skill it writes
+behind operator approval. It sets:
+
+| Hermes key | Value | Effect |
+| --- | --- | --- |
+| `skills.write_approval` | `true` | Every skill create, edit, patch, or delete is staged under `HERMES_HOME/pending/skills/` instead of being saved. This covers `/learn`, the post-turn background review, ordinary turns, and Captain's one-shot runs, which do not bypass the gate. |
+| `skills.guard_agent_created` | `true` | Agent-written skills pass the Hermes security scanner; a dangerous verdict rolls the write back. |
+| `skills.creation_nudge_interval` | `10` | Hermes reviews for a reusable skill after 10 iterations without one. The value is pinned because Hermes has no built-in default for it in `config.yaml`. |
+
+Teach Hermes on purpose with `/learn <folder, URL, notes, or "what we just did">`.
+Review what it learned with these slash commands inside a Hermes chat session
+(`hermes` CLI or TUI; they are not `hermes skills` shell subcommands):
+
+```text
+/skills pending
+/skills diff <id>
+/skills approve <id>
+/skills reject <id>
+```
+
+A new skill is created in the operator's local `HERMES_HOME/skills/` only. It is
+not a Captain-released factory skill: it is not digest-pinned, not in
+`/captain-agent-factory-loop`, and not published through the Gateway. Reject
+any pending edit, patch, or delete that targets one of the six released skills:
+Hermes stages such a foreground write like any other, and approving it would
+change the repository files and break the pinned digest, so this command would
+then refuse to configure. A new skill whose name matches a released skill is
+likewise refused here as a shadow. Memory writes (`memory.write_approval`) and
+the curator settings are left unchanged.
+
+Before changing these keys, the command records their previous values once in
+`HERMES_HOME/captain-hermes-learning-baseline.json`. A re-run keeps that first
+record.
+
+Rollback removes only this repository path and this bundle, and restores the
+recorded learning settings. It preserves unrelated external directories:
 
 ```powershell
 pwsh -NoProfile -File scripts/configure-hermes-factory-skills.ps1 `
