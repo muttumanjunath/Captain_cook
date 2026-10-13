@@ -455,7 +455,9 @@ function Write-ImmutableJson {
         [Parameter(Mandatory = $true)][object]$Value
     )
 
-    $json = ($Value | ConvertTo-Json -Depth 32) + "`n"
+    # ConvertTo-Json uses the host newline; pin the Windows bytes so immutable
+    # evidence compares equal on every platform.
+    $json = (($Value | ConvertTo-Json -Depth 32) -replace "`r?`n", "`r`n") + "`n"
     $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($json)
     $directory = Split-Path -Parent $Path
     $null = New-Item -ItemType Directory -Path $directory -Force
