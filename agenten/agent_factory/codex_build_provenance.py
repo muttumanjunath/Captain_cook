@@ -790,10 +790,17 @@ def _require_zipinfo_matches_central(
 ) -> None:
     encoding = "utf-8" if central.flags & _ZIP_UTF8_FLAG else "cp437"
     decoded_filename = central.filename.decode(encoding)
-    normalized_filename = decoded_filename.replace("\\", "/")
+    # zipfile rewrites only the host's own separators to "/", so a
+    # backslash survives on POSIX hosts. Mirror that exactly; backslash
+    # canonicalisation for every host happens in
+    # _require_canonical_source_zip_path.
+    expected_filename = decoded_filename
+    for separator in (os.sep, os.altsep):
+        if separator and separator != "/":
+            expected_filename = expected_filename.replace(separator, "/")
     if (
         item.orig_filename != decoded_filename
-        or item.filename != normalized_filename
+        or item.filename != expected_filename
         or item.flag_bits != central.flags
         or item.compress_type != central.compression
         or item.CRC != central.crc32
