@@ -160,6 +160,46 @@ async def test_gatekeeper_rejects_malformed_candidate_without_blocking_the_valid
     assert pipeline.ledger_query.count_in_stage(Stage.REJECTED) == 1
 
 
+async def test_unroutable_subproblem_is_dead_lettered_without_blocking_the_routable_one():
+    """A subproblem whose capability tag no registered worker owns must not
+    sit in Stage.ACCEPTED forever: the Coordinator publishes
+    SubproblemUnroutable and the Recorder persists it as a terminal FAILED
+    block, so wait_until_terminal converges and the routable sibling still
+    reaches DONE.
+    """
+
+    async def mixed_routing_decompose(description, depth):
+        if depth != 0:
+            return []
+        return [
+            {"description": "Echo the greeting back to the caller", "capability_tags": ["echo"], "atomic": True},
+            {"description": "Translate the greeting into Klingon", "capability_tags": ["klingon"], "atomic": True},
+        ]
+
+    chain = Blockchain(storage=InMemoryStorage())
+    pipeline = make_pipeline(blockchain=chain, llm_decompose=mixed_routing_decompose)
+    await pipeline.start()
+
+    await pipeline.submit_problem("Problem U: greet in every language")
+    converged = await pipeline.wait_until_terminal(expected_subproblem_count=2, timeout=5.0)
+    await pipeline.stop()
+
+    assert converged, "unroutable subproblem left the pipeline unsettled"
+    assert pipeline.recorder.errors == []
+    assert pipeline.ledger_query.count_in_stage(Stage.ACCEPTED) == 0
+
+    done_blocks = pipeline.ledger_query.blocks_in_stage(Stage.DONE)
+    assert [block.data["capability_tags"] for block in done_blocks] == [["echo"]]
+
+    failed_blocks = pipeline.ledger_query.blocks_in_stage(Stage.FAILED)
+    assert len(failed_blocks) == 1
+    failed = failed_blocks[0]
+    assert failed.data["capability_tags"] == ["klingon"]
+    assert failed.metadata["unroutable_capability_tags"] == ["klingon"]
+    assert failed.metadata["retriable"] is False
+    assert "No capable agent type" in failed.metadata["failure_reason"]
+
+
 async def test_boot_validation_rejects_capability_registered_to_unknown_agent_type():
     """CapabilityRegistry is "validated at boot, not trusted blindly" per
     its own module docstring -- prove the validator build_pipeline calls

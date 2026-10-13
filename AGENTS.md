@@ -105,7 +105,6 @@ to opt in; never let an ordinary regression run mutate a reachable service.
   gap plan instead of guessing branch ownership.
 - `agenten/ledger_bridge/recorder.py` and
   `agenten/orchestration/pipeline.py` are concentration hotspots.
-- Permanently unroutable work lacks a durable dead-letter event.
 - The AutoGen event-bus subscription boundary is intentionally incomplete.
 - The architecture document does not yet describe the full event-driven path;
   code and tests are the stronger evidence where they disagree with prose.
